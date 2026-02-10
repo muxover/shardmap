@@ -1,0 +1,38 @@
+[package]
+name = "shardmap"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jax (@muxover)"]
+description = "A high-performance concurrent sharded map for extreme workloads"
+license = "Apache-2.0"
+repository = "https://github.com/muxover/shardmap"
+documentation = "https://docs.rs/shardmap"
+readme = "README.md"
+keywords = ["concurrent", "hashmap", "sharded", "thread-safe", "performance"]
+categories = ["concurrency", "data-structures"]
+
+[lib]
+name = "shardmap"
+path = "src/lib.rs"
+
+[dependencies]
+hashbrown = "0.14"
+parking_lot = "0.12"
+ahash = "0.8"
+
+[dependencies.fxhash]
+version = "0.2"
+optional = true
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+dashmap = "5.5"
+rand = "0.8"
+
+[features]
+default = []
+fxhash = ["dep:fxhash"]
+
+[[bench]]
+name = "benchmarks"
+harness = false
