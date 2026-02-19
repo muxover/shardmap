@@ -12,11 +12,49 @@ pub enum HashFunction {
     FxHash,
 }
 
+/// User-provided shard selection. Enables stateful or custom routing.
+pub trait ShardRouter: Send + Sync {
+    /// Return the shard index in `[0, shard_count)` for the given key hash.
+    fn route(&self, key_hash: u64, shard_count: usize) -> usize;
+}
+
+/// Default routing: `(hash as usize) & (shard_count - 1)`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultRouter;
+
+impl ShardRouter for DefaultRouter {
+    #[inline]
+    fn route(&self, key_hash: u64, shard_count: usize) -> usize {
+        (key_hash as usize) & (shard_count - 1)
+    }
+}
+
+/// Routing strategy for shard selection.
+#[derive(Default)]
+pub enum RoutingConfig {
+    /// Default: hash & (shard_count - 1).
+    #[default]
+    Default,
+    /// User-provided router (e.g. stateful or custom distribution).
+    Custom(Box<dyn ShardRouter>),
+}
+
+impl std::fmt::Debug for RoutingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RoutingConfig::Default => write!(f, "RoutingConfig::Default"),
+            RoutingConfig::Custom(_) => write!(f, "RoutingConfig::Custom(...)"),
+        }
+    }
+}
+
 /// Configuration for a ShardMap instance.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Config {
     pub(crate) shard_count: usize,
     pub(crate) hash_function: HashFunction,
+    pub(crate) capacity_per_shard: Option<usize>,
+    pub(crate) routing: RoutingConfig,
 }
 
 impl Config {
@@ -39,6 +77,13 @@ impl Config {
         self.hash_function = hash_fn;
         self
     }
+
+    /// Set initial capacity per shard. Total capacity will be approximately
+    /// `capacity_per_shard * shard_count`. Omitted by default (HashMap default).
+    pub fn capacity_per_shard(mut self, capacity: usize) -> Self {
+        self.capacity_per_shard = Some(capacity);
+        self
+    }
 }
 
 impl Default for Config {
@@ -46,6 +91,8 @@ impl Default for Config {
         Self {
             shard_count: 16,
             hash_function: HashFunction::AHash,
+            capacity_per_shard: None,
+            routing: RoutingConfig::Default,
         }
     }
 }
@@ -72,6 +119,18 @@ impl ShardMapBuilder {
     /// Set the hash function to use.
     pub fn hash_function(mut self, hash_fn: HashFunction) -> Self {
         self.config = self.config.hash_function(hash_fn);
+        self
+    }
+
+    /// Set initial capacity per shard. Total capacity ≈ `capacity_per_shard * shard_count`.
+    pub fn capacity_per_shard(mut self, capacity: usize) -> Self {
+        self.config = self.config.capacity_per_shard(capacity);
+        self
+    }
+
+    /// Use a custom shard router (e.g. for stateful or custom distribution).
+    pub fn routing(mut self, routing: RoutingConfig) -> Self {
+        self.config.routing = routing;
         self
     }
 

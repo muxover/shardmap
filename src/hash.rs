@@ -2,8 +2,10 @@ use std::hash::{Hash, Hasher};
 
 /// Hash function implementation for shard assignment.
 /// Uses an enum to avoid trait object limitations with generics.
+#[derive(Default)]
 pub enum ShardHasher {
     /// AHash implementation (default, fast and well-distributed).
+    #[default]
     AHash,
     /// FxHash implementation (faster but potentially less distributed).
     #[cfg(feature = "fxhash")]
@@ -12,7 +14,7 @@ pub enum ShardHasher {
 
 impl ShardHasher {
     /// Hash a key to determine which shard it belongs to.
-    pub fn hash_key<K: Hash>(&self, key: &K) -> u64 {
+    pub fn hash_key<K: Hash + ?Sized>(&self, key: &K) -> u64 {
         match self {
             ShardHasher::AHash => {
                 let mut hasher = ahash::AHasher::default();
@@ -26,11 +28,5 @@ impl ShardHasher {
                 hasher.finish()
             }
         }
-    }
-}
-
-impl Default for ShardHasher {
-    fn default() -> Self {
-        ShardHasher::AHash
     }
 }

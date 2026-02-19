@@ -1,14 +1,14 @@
 [package]
 name = "shardmap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jax (@muxover)"]
-description = "A high-performance concurrent sharded map for extreme workloads"
+description = "A performance-predictable, introspectable concurrent map for engineers who care about load behavior"
 license = "Apache-2.0"
 repository = "https://github.com/muxover/shardmap"
 documentation = "https://docs.rs/shardmap"
 readme = "README.md"
-keywords = ["concurrent", "hashmap", "sharded", "thread-safe", "performance"]
+keywords = ["concurrent", "hashmap", "sharded", "thread-safe", "performance", "diagnostics", "observability"]
 categories = ["concurrency", "data-structures"]
 
 [lib]
@@ -26,11 +26,11 @@ optional = true
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-dashmap = "5.5"
-rand = "0.8"
 
 [features]
 default = []
+metrics = []
+lock-timing = ["metrics"]
 fxhash = ["dep:fxhash"]
 
 [[bench]]

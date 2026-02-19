@@ -6,26 +6,22 @@
 [![Documentation](https://docs.rs/shardmap/badge.svg)](https://docs.rs/shardmap)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**A high-performance concurrent sharded map for extreme workloads**
+**Performance-predictable, introspectable concurrent map for Rust.**
 
-[Features](#features) • [Quick Start](#quick-start) • [Documentation](https://docs.rs/shardmap) • [Examples](#examples) • [When to Use](#when-to-use-shardmap) • [Benchmarks](#benchmarks)
+[Features](#-features) • [Quick Start](#-quick-start) • [Documentation](https://docs.rs/shardmap) • [Configuration](#️-configuration) • [API Overview](#-api-overview) • [Benchmarks](#-benchmarks) • [Non-goals](#-non-goals) • [License](#-license)
 
 </div>
 
 ---
 
-ShardMap is a production-grade Rust library providing a high-performance concurrent sharded map designed for extreme workloads (millions of operations per second). It distributes key-value pairs across multiple shards, each protected by its own read-write lock, to minimize lock contention and maximize concurrent throughput.
+ShardMap is a concurrent map for engineers who care about **load behavior**: deterministic shard routing, predictable lock isolation, and optional built-in diagnostics.
 
 ## ✨ Features
 
-- 🚀 **High Performance**: Sharded design minimizes lock contention under concurrent access
-- 🔒 **Thread-Safe**: All operations are safe for concurrent access from multiple threads
-- 📦 **Zero-Copy Reads**: Values stored as `Arc<T>` for efficient sharing without cloning
-- 🎯 **Deterministic**: Same key always maps to the same shard (consistent behavior)
-- ⚙️ **Configurable**: Choose shard count and hash function to optimize for your workload
-- 📊 **Statistics**: Per-shard operation tracking for monitoring and optimization
-- 🔄 **Atomic Rename**: Built-in atomic key renaming operation
-- 🏭 **Production-Ready**: Designed for millions of operations per second
+- 🔒 **Zero global lock** — Data is split across shards; each shard has its own lock. Operations on different shards do not block each other.
+- 🎯 **Deterministic routing** — The same key always maps to the same shard. Custom routers are supported.
+- 📊 **Optional diagnostics** — Enable the `metrics` feature for per-shard read/write/remove and lock counts. `shard_loads()` works without any feature.
+- ⚡ **Pre-hashed APIs** — When you already have a hash (e.g. from a packet header), use `get_by_hash`, `insert_by_hash`, `remove_by_hash` to avoid re-hashing for shard selection.
 
 ## 📦 Installation
 
@@ -33,14 +29,23 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-shardmap = "0.1"
+shardmap = "0.2"
 ```
 
-Or with the optional `fxhash` feature:
+**Optional features:**
+
+| Feature       | Description |
+|--------------|-------------|
+| `metrics`    | Per-shard read/write/remove and lock-acquisition counters. Enables op counts in `diagnostics()`. |
+| `lock-timing` | Per-shard lock wait time. **For debugging and profiling only** — not for production hot paths. |
+| `fxhash`     | Use FxHash for shard assignment. |
 
 ```toml
-[dependencies]
-shardmap = { version = "0.1", features = ["fxhash"] }
+# With diagnostics
+shardmap = { version = "0.2", features = ["metrics"] }
+
+# Minimal overhead (no metrics)
+shardmap = { version = "0.2", default-features = false }
 ```
 
 ## 🚀 Quick Start
@@ -48,519 +53,142 @@ shardmap = { version = "0.1", features = ["fxhash"] }
 ```rust
 use shardmap::ShardMap;
 
-fn main() {
-    // Create a new sharded map
-    let map = ShardMap::new();
-    
-    // Insert values
-    map.insert("key1", "value1");
-    map.insert("key2", "value2");
-    
-    // Read values (zero-copy via Arc)
-    if let Some(value) = map.get(&"key1") {
-        println!("Found: {}", *value);
-    }
-    
-    // Update values
-    map.update(&"key1", |v| {
-        // Modify value in place
-    });
-    
-    // Remove values
-    map.remove(&"key1");
-    
-    // Get statistics
-    let stats = map.stats();
-    println!("Total entries: {}", stats.size);
-}
-```
-
-## 📖 Table of Contents
-
-- [What is Sharding?](#what-is-sharding)
-- [When to Use ShardMap](#when-to-use-shardmap)
-- [Examples](#examples)
-- [Configuration](#configuration)
-- [Performance](#performance)
-- [Benchmarks](#benchmarks)
-- [API Reference](#api-reference)
-- [Design Decisions](#design-decisions)
-- [Non-Goals](#non-goals)
-- [Contributing](#contributing)
-- [License](#license)
-
-## 🔍 What is Sharding?
-
-Sharding is a technique that splits data across multiple independent partitions (shards). In ShardMap, each shard contains its own `HashMap` protected by a read-write lock. When you perform an operation:
-
-1. The key is hashed to determine which shard it belongs to
-2. Only that shard's lock is acquired (not a global lock)
-3. The operation proceeds on that shard
-
-This means that operations on different shards can proceed concurrently without blocking each other, dramatically improving throughput under high contention.
-
-### Example Scenario
-
-With a single-lock `HashMap`, 8 threads trying to insert simultaneously will all contend for the same lock, causing serialization. With ShardMap using 16 shards:
-
-- ✅ Threads operating on different shards proceed in parallel
-- ✅ Only threads operating on the same shard contend
-- ✅ Expected speedup: **~8-16x** for write-heavy workloads
-
-## 🎯 When to Use ShardMap
-
-### ✅ Use ShardMap When:
-
-1. **You Need Observability and Debugging**
-   - Per-shard statistics help identify hot shards and contention
-   - Deterministic shard assignment makes debugging predictable
-   - You can monitor exactly which shards are being hit
-
-2. **You Need Deterministic Behavior**
-   - Same key always maps to the same shard
-   - Useful for shard-specific operations (e.g., flushing specific shards)
-   - Important for reproducible behavior in tests
-
-3. **You Need Fine-Tuned Control**
-   - Want to choose shard count based on your CPU cores
-   - Need to select hash function for your key distribution
-   - Building systems that benefit from explicit shard management
-
-4. **You Need Atomic Rename Operations**
-   - ShardMap provides `rename()` that moves values atomically
-   - Useful for key migration scenarios
-   - DashMap doesn't have this feature
-
-5. **You Want Simpler Implementation**
-   - ShardMap's code is straightforward: sharded HashMaps with locks
-   - Easier to understand, modify, and audit
-   - Good for learning concurrent data structures
-
-6. **You're Building on Top of It**
-   - Rate limiters with per-shard counters
-   - Caches with per-shard eviction policies
-   - Systems needing shard-level operations
-
-### ❌ Use DashMap Instead When:
-
-1. **Pure Performance is Your Only Concern**
-   - DashMap is typically 1.5-2x faster in benchmarks
-   - Uses advanced lock-free techniques
-   - Battle-tested in production
-
-2. **You Don't Need Per-Shard Visibility**
-   - Just need a fast concurrent map
-   - Don't care about shard-level statistics
-   - Black-box behavior is acceptable
-
-3. **You Want Maximum Speed Out of the Box**
-   - DashMap works great with defaults
-   - No tuning needed
-   - Optimized for general use cases
-
-### 📊 Performance Comparison
-
-Based on real benchmarks:
-
-| Scenario | ShardMap | DashMap | Winner |
-|----------|----------|---------|--------|
-| **Single-threaded** | ~60µs | ~26µs | DashMap |
-| **Concurrent inserts (8 threads)** | ~8.4ms (64 shards) | ~5.8ms | DashMap |
-| **Mixed workload** | ~2.6ms (16 shards) | ~1.8ms | DashMap |
-| **vs Single-lock HashMap** | **3.3x faster** | **4.8x faster** | Both win |
-
-**Key Insight**: ShardMap is still **3x faster than single-lock HashMap**, which is excellent. DashMap is faster, but ShardMap provides more control and visibility.
-
-### Real-World Use Cases
-
-**ShardMap excels at:**
-
-- **Session Stores**: Track user sessions with per-shard statistics
-- **Rate Limiters**: Implement rate limiting with per-shard counters
-- **Caches**: Build caches with shard-level eviction policies
-- **State Management**: Manage application state with observability
-- **Analytics**: Track metrics with per-shard breakdowns
-- **Debugging**: Identify performance bottlenecks through shard statistics
-
-**Example: Rate Limiter**
-```rust
-use shardmap::ShardMap;
-use std::time::{Duration, Instant};
-
-struct RateLimiter {
-    map: ShardMap<String, (Instant, u32)>,
-    limit: u32,
-    window: Duration,
-}
-
-impl RateLimiter {
-    fn check(&self, key: String) -> bool {
-        let now = Instant::now();
-        self.map.update(&key, |(last, count)| {
-            if now.duration_since(*last) > self.window {
-                *last = now;
-                *count = 1;
-            } else {
-                *count += 1;
-            }
-        });
-        
-        // Check per-shard stats to see which shards are hot
-        let stats = self.map.stats();
-        // ... monitor shard activity
-        true
-    }
-}
-```
-
-## 💡 Examples
-
-### Basic Operations
-
-```rust
-use shardmap::ShardMap;
-
 let map = ShardMap::new();
-
-// Insert values
 map.insert("key1", "value1");
 map.insert("key2", "value2");
 
-// Read values (zero-copy via Arc)
-if let Some(value) = map.get(&"key1") {
-    println!("Found: {}", *value);
-    // value is Arc<&str>, can be cloned cheaply or accessed directly
+if let Some(v) = map.get(&"key1") {
+    println!("{}", *v);
 }
 
-// Update values (requires V: Clone)
-map.update(&"key1", |v| {
-    // Modify value in place
-});
-
-// Remove values
-map.remove(&"key1");
-
-// Check size
-println!("Map size: {}", map.len());
+// Per-shard entry counts (no feature required)
+let loads = map.shard_loads();
+println!("Shard loads: {:?}", loads);
 ```
 
-### Concurrent Access
+## ✨ When to use ShardMap
 
-```rust
-use shardmap::ShardMap;
-use std::sync::Arc;
-use std::thread;
+- You need to **see what your map is doing under load** (shard loads, imbalance, hot shards).
+- You are **tuning** shard count, capacity, or routing for your CPU and workload.
+- You want **predictable shard isolation** and control over shard count (scaling is relative to how many shards you use).
+- You are building **rate limiters**, **caches**, or **session stores** that benefit from per-shard visibility or `rename` (atomic within a shard; cross-shard rename acquires two shard locks).
 
-let map = Arc::new(ShardMap::new());
+## 📋 API Overview
 
-// Spawn multiple threads
-let mut handles = vec![];
-for i in 0..10 {
-    let map = Arc::clone(&map);
-    let handle = thread::spawn(move || {
-        for j in 0..1000 {
-            map.insert(format!("key_{}_{}", i, j), j);
-        }
-    });
-    handles.push(handle);
-}
+### Map operations
 
-// Wait for all threads
-for handle in handles {
-    handle.join().unwrap();
-}
+| Method | Description |
+|--------|-------------|
+| `insert`, `get`, `remove` | Core operations. |
+| `get_or_insert`, `get_or_insert_with`, `try_insert` | Convenience. |
+| `update`, `rename` | In-place update; rename is atomic within one shard (cross-shard acquires two locks). |
+| `contains_key`, `len`, `is_empty`, `clear`, `retain` | Queries and bulk ops. |
+| `capacity`, `shrink_to_fit` | Capacity control. |
 
-println!("Final size: {}", map.len());
-```
+### Introspection
 
-### Atomic Rename Operations
-
-```rust
-use shardmap::ShardMap;
-
-let map = ShardMap::new();
-map.insert("old_key", "value");
-
-// Atomically rename a key (moves the value, doesn't copy)
-map.rename(&"old_key", "new_key").unwrap();
-
-assert!(map.get(&"old_key").is_none());
-assert_eq!(*map.get(&"new_key").unwrap(), "value");
-```
+| Method | Description |
+|--------|-------------|
+| `shard_loads()` | Per-shard entry counts. No feature required. |
+| `diagnostics()` | Snapshot: `total_entries`, per-shard stats, `total_operations`, `avg_load_per_shard`, **`max_load_ratio`** (you interpret). |
+| `stats()` | Per-shard sizes and op counts. |
+| `shard_for_key(key)` | Shard index for a key. |
+| `hash_for_key(key)` | Hash used for routing. |
+| `shard_for_hash(hash)` | Shard index for a precomputed hash. |
+| `get_by_hash(key, hash)` | Get using precomputed hash for shard selection. |
+| `insert_by_hash(key, value, hash)` | Insert with precomputed hash. |
+| `remove_by_hash(key, hash)` | Remove with precomputed hash. |
 
 ### Iteration
 
-```rust
-use shardmap::ShardMap;
-
-let map = ShardMap::new();
-map.insert("key1", "value1");
-map.insert("key2", "value2");
-map.insert("key3", "value3");
-
-// Snapshot iteration (captures current state)
-for (key, value) in map.iter_snapshot() {
-    println!("{}: {}", key, *value);
-}
-
-// Concurrent-safe iteration (sees live updates)
-for (key, value) in map.iter_concurrent() {
-    println!("{}: {}", key, *value);
-}
-```
-
-### Statistics and Monitoring
-
-```rust
-use shardmap::ShardMap;
-
-let map = ShardMap::new();
-// ... perform operations ...
-
-let stats = map.stats();
-println!("Total entries: {}", stats.size);
-println!("Shard sizes: {:?}", stats.shard_sizes);
-
-// Per-shard operation counts - great for debugging!
-for (i, ops) in stats.operations.iter().enumerate() {
-    if ops.reads + ops.writes + ops.removes > 0 {
-        println!("Shard {}: {} reads, {} writes, {} removes", 
-                 i, ops.reads, ops.writes, ops.removes);
-    }
-}
-
-// Identify hot shards
-let max_ops = stats.operations.iter()
-    .map(|op| op.reads + op.writes + op.removes)
-    .max()
-    .unwrap();
-println!("Hottest shard has {} operations", max_ops);
-```
+- `iter_snapshot()` — Snapshot of current state.
+- `iter_concurrent()` — Live view (holds shard locks while iterating).
 
 ## ⚙️ Configuration
 
-### Custom Shard Count
+```rust
+use shardmap::{ShardMapBuilder, HashFunction, RoutingConfig};
+
+// Full control
+let map = ShardMapBuilder::new()
+    .shard_count(32)?
+    .capacity_per_shard(256)
+    .hash_function(HashFunction::AHash)
+    .routing(RoutingConfig::Default)
+    .build::<String, i32>()?;
+
+// Convenience
+let map = ShardMap::with_capacity(4096);  // capacity spread across default 16 shards
+let map = ShardMap::with_shard_count(64)?;
+```
+
+Shard count must be a power of two (2, 4, 8, 16, 32, 64, …). Start with 16 and tune from there.
+
+## 📊 Diagnostics and imbalance
+
+`diagnostics()` returns a snapshot with **`max_load_ratio`** (max shard load / average load). There is no hardcoded “imbalance” threshold — you decide (e.g. alert when `max_load_ratio > 2.0`).
 
 ```rust
-use shardmap::ShardMapBuilder;
-
-let map = ShardMapBuilder::new()
-    .shard_count(32)?  // Must be power of two (2, 4, 8, 16, 32, 64, ...)
-    .build::<String, i32>()?;
+let diag = map.diagnostics();
+println!("Total entries: {}", diag.total_entries);
+println!("Max load ratio: {}", diag.max_load_ratio);
+for (i, s) in diag.shards.iter().enumerate() {
+    if s.entries > 0 {
+        println!("  Shard {}: {} entries", i, s.entries);
+    }
+}
 ```
 
-**Choosing shard count:**
-- **Too few shards**: High contention, poor performance
-- **Too many shards**: Overhead from managing many locks, diminishing returns
-- **Sweet spot**: Typically **8-64 shards**, depending on:
-  - Number of CPU cores
-  - Expected contention level
-  - Workload characteristics (read-heavy vs write-heavy)
+Without the `metrics` feature, `diagnostics()` still provides `total_entries`, `shards[].entries`, `avg_load_per_shard`, and `max_load_ratio`; op counts are 0.
 
-**💡 Rule of thumb**: Start with **16 shards**, measure, and adjust based on your workload.
+## 🔀 Custom shard routing
 
-### Hash Function Selection
+Implement the `ShardRouter` trait and pass it to the builder:
 
 ```rust
-use shardmap::{ShardMapBuilder, HashFunction};
+use shardmap::{ShardMapBuilder, ShardRouter, RoutingConfig};
+
+struct MyRouter;
+impl ShardRouter for MyRouter {
+    fn route(&self, key_hash: u64, shard_count: usize) -> usize {
+        (key_hash as usize) % shard_count  // or your logic
+    }
+}
 
 let map = ShardMapBuilder::new()
-    .hash_function(HashFunction::AHash)  // Default: fast and well-distributed
-    .build::<String, i32>()?;
-
-// With fxhash feature enabled:
-#[cfg(feature = "fxhash")]
-let map = ShardMapBuilder::new()
-    .hash_function(HashFunction::FxHash)  // Faster but potentially less distributed
-    .build::<String, i32>()?;
+    .shard_count(16)
+    .unwrap()
+    .routing(RoutingConfig::Custom(Box::new(MyRouter)))
+    .build::<String, i32>()
+    .unwrap();
 ```
 
-**Hash function comparison:**
-- **AHash (default)**: Fast, well-distributed, good for most use cases
-- **FxHash**: Faster, but may have worse distribution for some key types
+Default behavior is `hash & (shard_count - 1)` via `DefaultRouter`.
 
-Enable fxhash support with the `fxhash` feature:
-```toml
-[dependencies]
-shardmap = { version = "0.1", features = ["fxhash"] }
-```
+## 🏁 Benchmarks
 
-## ⚡ Performance
-
-### Performance Guarantees
-
-- ✅ **Lock-free reads per shard**: Reads on different shards don't block each other
-- ✅ **Deterministic shard assignment**: Same key always maps to same shard
-- ✅ **No global locks**: All operations only lock the relevant shard(s)
-- ✅ **Linear scalability**: Performance scales with number of shards (up to a point)
-
-### Expected Performance
-
-| Workload Type | Performance |
-|--------------|-------------|
-| **Single-threaded** | Comparable to `hashbrown::HashMap` (minimal overhead) |
-| **Multi-threaded reads** | Near-linear scaling with shard count |
-| **Multi-threaded writes** | 2-16x faster than single-lock HashMap (depending on contention) |
-| **Mixed workloads** | Excellent performance for read-heavy and balanced workloads |
-
-### Real Benchmark Results
-
-Based on actual benchmarks with 8 threads:
-
-**Concurrent Inserts (80,000 operations):**
-- Single-lock HashMap: **27.8 ms**
-- DashMap: **5.8 ms**
-- ShardMap (16 shards): **10.0 ms** (2.8x faster than single-lock)
-- ShardMap (64 shards): **8.4 ms** (3.3x faster than single-lock)
-
-**Mixed Workload (70% reads, 30% writes):**
-- Single-lock HashMap: **5.9 ms**
-- DashMap: **1.8 ms**
-- ShardMap (16 shards): **2.6 ms** (2.3x faster than single-lock)
-- ShardMap (64 shards): **2.7 ms** (2.2x faster than single-lock)
-
-**Key Takeaway**: ShardMap provides significant speedup over single-lock HashMap (2-3x), while DashMap is faster but offers less control.
-
-## 📊 Benchmarks
-
-ShardMap is benchmarked against:
-- Single-lock `RwLock<HashMap>`: Baseline for comparison
-- `DashMap`: Popular concurrent HashMap library
-
-### Running Benchmarks
+Run with:
 
 ```bash
 cargo bench
 ```
 
-This will generate detailed benchmark reports in `target/criterion/` with HTML visualizations comparing ShardMap against other implementations.
+All ShardMap benchmarks use the **default** build (no `metrics` feature).
 
-### Benchmark Results Summary
+## 🏗️ Design
 
-**Single-threaded workloads:**
-- ShardMap has overhead from shard selection (~2-3x slower than single-lock)
-- This is expected - sharding helps with contention, not single-threaded performance
+- **Locks** — `parking_lot::RwLock` per shard for speed and fairness.
+- **Storage** — `hashbrown::HashMap` and `Arc<V>` for values. Values are stored in `Arc<V>` so readers can clone the pointer and use the value without holding the shard lock.
+- **Shard count** — Power of two so routing uses a mask instead of modulo.
 
-**Multi-threaded insert workloads:**
-- ShardMap (16 shards): **4-8x faster** than single-lock HashMap
-- ShardMap (64 shards): **8-16x faster** than single-lock HashMap
-- DashMap is typically 1.5x faster than ShardMap
+## 🚫 Non-goals
 
-**Multi-threaded read workloads:**
-- ShardMap: Near-linear scaling with shard count
-- Excellent performance for read-heavy scenarios
+ShardMap is focused. The following are explicitly **not** goals:
 
-**Mixed workloads (70% reads, 30% writes):**
-- ShardMap: **2-4x faster** than single-lock HashMap
-- Excellent balance of read and write performance
-
-## 📚 API Reference
-
-### Main Types
-
-- `ShardMap<K, V>`: The main concurrent map type
-- `ShardMapBuilder`: Builder for configuring ShardMap instances
-- `Config`: Configuration options
-- `Stats`: Statistics about map usage
-- `Error`: Error types for operations
-
-### Key Methods
-
-| Method | Description | Returns |
-|--------|-------------|---------|
-| `insert(key, value)` | Insert or update a key-value pair | `Option<Arc<V>>` |
-| `get(key)` | Get a value by key (zero-copy) | `Option<Arc<V>>` |
-| `remove(key)` | Remove a key-value pair | `Option<Arc<V>>` |
-| `update(key, f)` | Update a value using a closure | `Option<Arc<V>>` |
-| `rename(old_key, new_key)` | Atomically rename a key | `Result<(), Error>` |
-| `len()` | Get total number of entries | `usize` |
-| `is_empty()` | Check if map is empty | `bool` |
-| `stats()` | Get detailed statistics | `Stats` |
-| `iter_snapshot()` | Create snapshot-based iterator | `SnapshotIter` |
-| `iter_concurrent()` | Create concurrent-safe iterator | `ConcurrentIter` |
-
-### Type Constraints
-
-- `K: Hash + Eq + Send + Sync`: Keys must be hashable, comparable, and thread-safe
-- `V: Send + Sync`: Values must be thread-safe
-- `V: Clone`: Required for `update()` method
-- `K: Clone`: Required for `rename()` method and iteration
-
-For detailed API documentation, see [docs.rs/shardmap](https://docs.rs/shardmap).
-
-## 🏗️ Design Decisions
-
-### Why `parking_lot::RwLock`?
-
-`parking_lot` provides faster, fairer locks than the standard library's `RwLock`. It's optimized for high-contention scenarios and provides better performance characteristics for our use case.
-
-### Why `hashbrown::HashMap`?
-
-`hashbrown` is a Rust port of Google's SwissTable, providing superior performance to the standard library's `HashMap`. It's faster for both inserts and lookups, which directly benefits ShardMap's performance.
-
-### Why `Arc<T>` for Values?
-
-Values are stored behind `Arc<T>` to enable:
-- **Zero-copy reads**: Multiple threads can read the same value without cloning
-- **Safe concurrent access**: `Arc` provides thread-safe reference counting
-- **Efficient sharing**: Cloning an `Arc` is cheap (just increments a counter)
-
-### Why Power-of-Two Shard Counts?
-
-Power-of-two shard counts allow us to use bitwise masking (`hash & (count - 1)`) instead of modulo, which is significantly faster. This optimization is critical for high-performance scenarios.
-
-## 🎯 Use Cases
-
-ShardMap is ideal for:
-
-- 🏦 **High-frequency trading systems**: Ultra-low latency requirements with observability
-- 🌐 **Web servers**: Session stores, rate limiters, caches with per-shard monitoring
-- 🎮 **Game servers**: Player state, world state with shard-level operations
-- 📈 **Real-time analytics**: Aggregation, counting, state management with statistics
-- 🗄️ **Database connection pools**: Tracking active connections with per-shard metrics
-- 🔍 **Debugging performance issues**: Identify hot shards through statistics
-- 🛠️ **Building specialized systems**: Rate limiters, caches, state stores that benefit from shard control
-- ⚡ **Any system requiring millions of operations per second with observability**
-
-## 🚫 Non-Goals
-
-ShardMap is designed to be a focused, high-performance concurrent map. The following are explicitly **not** goals:
-
-- ❌ **Persistence**: No disk I/O, no serialization
-- ❌ **Async support**: Synchronous API only (use with async runtimes as needed)
-- ❌ **External dependencies**: Minimal dependencies (only performance-critical crates)
-- ❌ **Complex features**: No expiration, no LRU, no transactions
-- ❌ **Key ordering**: Keys are not ordered (use `BTreeMap` if needed)
-
-If you need these features, consider building on top of ShardMap or using it as a component in a larger system.
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-### Development Setup
-
-```bash
-# Clone the repository
-git clone https://github.com/muxover/shardmap.git
-cd shardmap
-
-# Run tests
-cargo test
-
-# Run benchmarks
-cargo bench
-
-# Check documentation
-cargo doc --open
-```
-
-### Code Style
-
-- Follow Rust standard formatting (`cargo fmt`)
-- Run clippy (`cargo clippy`)
-- Ensure all tests pass
-- Update documentation for API changes
+- **Drop-in for other maps** — Not a replacement for DashMap or std HashMap; different tradeoffs and API.
+- **Read-heavy specialization** — Not tuned specifically for read-heavy workloads (consider evmap or similar if that’s your main use case).
+- **Dynamic sharding** — No background rebalancing or dynamic shard resizing; shard count is fixed at build time.
+- **Eviction or persistence** — No built-in eviction, LRU, or persistence; use with other crates if needed.
 
 ## 📄 License
 
@@ -572,6 +200,7 @@ Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or http://www
 - **Documentation**: https://docs.rs/shardmap
 - **Repository**: https://github.com/muxover/shardmap
 - **Issues**: https://github.com/muxover/shardmap/issues
+- **Changelog**: [CHANGELOG.md](CHANGELOG.md)
 
 ---
 

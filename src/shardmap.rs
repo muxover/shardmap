@@ -1,8 +1,9 @@
-use crate::config::{create_hasher, Config};
+use crate::config::{create_hasher, Config, RoutingConfig};
 use crate::error::Error;
 use crate::hash::ShardHasher;
 use crate::shard::Shard;
-use crate::stats::{ShardOps, Stats};
+use crate::stats::{Diagnostics, ShardDiagnostics, ShardOps, Stats};
+use std::borrow::Borrow;
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -28,6 +29,7 @@ pub struct ShardMap<K, V> {
     shards: Vec<Shard<K, V>>,
     shard_mask: usize,
     hash: ShardHasher,
+    routing: RoutingConfig,
 }
 
 impl<K, V> ShardMap<K, V>
@@ -40,6 +42,22 @@ where
         Self::with_config(Config::default()).unwrap()
     }
 
+    /// Create a new map with the given number of shards (must be a power of two).
+    /// Convenience for `ShardMapBuilder::new().shard_count(n).unwrap().build()`.
+    pub fn with_shard_count(shard_count: usize) -> Result<Self, Error> {
+        Self::with_config(Config::default().shard_count(shard_count)?)
+    }
+
+    /// Create a new map with at least this total capacity, spread across shards.
+    /// Shard count defaults to 16. For more control use `ShardMapBuilder`.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let config = Config::default();
+        let shard_count = config.shard_count;
+        let cap_per_shard = capacity.saturating_add(shard_count - 1) / shard_count;
+        let config = config.capacity_per_shard(cap_per_shard);
+        Self::with_config(config).unwrap()
+    }
+
     /// Create a new map with custom config.
     pub fn with_config(config: Config) -> Result<Self, Error> {
         if config.shard_count == 0 || !config.shard_count.is_power_of_two() {
@@ -47,23 +65,73 @@ where
         }
 
         let shard_count = config.shard_count;
+        let cap_per_shard = config.capacity_per_shard.unwrap_or(0);
         let mut shards = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            shards.push(Shard::new());
+            shards.push(Shard::with_capacity(cap_per_shard));
         }
 
         Ok(Self {
             shards,
             shard_mask: shard_count - 1,
             hash: create_hasher(config.hash_function),
+            routing: config.routing,
         })
+    }
+
+    /// Route a key hash to a shard index.
+    #[inline]
+    fn route_hash(&self, hash: u64) -> usize {
+        match &self.routing {
+            RoutingConfig::Default => (hash as usize) & self.shard_mask,
+            RoutingConfig::Custom(router) => router.route(hash, self.shards.len()),
+        }
     }
 
     /// Figure out which shard this key belongs to.
     #[inline]
     fn shard_index(&self, key: &K) -> usize {
         let hash = self.hash.hash_key(key);
-        (hash as usize) & self.shard_mask
+        self.route_hash(hash)
+    }
+
+    /// Returns the hash of a key for shard routing. Use with `shard_for_hash` or `*_by_hash` when you already have a hash.
+    #[inline]
+    pub fn hash_for_key<Q>(&self, key: &Q) -> u64
+    where
+        Q: Hash + ?Sized,
+    {
+        self.hash.hash_key(key)
+    }
+
+    /// Returns which shard index the given hash maps to. Use with pre-hashed keys.
+    #[inline]
+    pub fn shard_for_hash(&self, hash: u64) -> usize {
+        self.route_hash(hash)
+    }
+
+    /// Returns which shard index the given key maps to.
+    ///
+    /// Use this for observability, shard-aware logic (e.g. per-shard eviction),
+    /// or to interpret `stats().operations[shard_for_key(k)]`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use shardmap::ShardMap;
+    ///
+    /// let map = ShardMap::new();
+    /// map.insert("user:42", "data");
+    /// let shard = map.shard_for_key(&"user:42");
+    /// let stats = map.stats();
+    /// println!("Shard {} ops: {:?}", shard, stats.operations[shard]);
+    /// ```
+    #[inline]
+    pub fn shard_for_key<Q>(&self, key: &Q) -> usize
+    where
+        Q: Hash + ?Sized,
+    {
+        self.shard_for_hash(self.hash_for_key(key))
     }
 
     /// Insert a key-value pair. Returns the old value if the key existed.
@@ -119,6 +187,124 @@ where
         self.shards[shard_idx].remove(key)
     }
 
+    /// Get a value by key using a precomputed hash for shard selection (avoids re-hashing for routing).
+    pub fn get_by_hash<Q>(&self, key: &Q, key_hash: u64) -> Option<Arc<V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let shard_idx = self.shard_for_hash(key_hash);
+        self.shards[shard_idx].get(key)
+    }
+
+    /// Insert using a precomputed hash for shard selection. Returns the previous value if the key existed.
+    pub fn insert_by_hash(&self, key: K, value: V, key_hash: u64) -> Option<Arc<V>> {
+        let shard_idx = self.shard_for_hash(key_hash);
+        self.shards[shard_idx].insert(key, value)
+    }
+
+    /// Remove by key using a precomputed hash for shard selection.
+    pub fn remove_by_hash<Q>(&self, key: &Q, key_hash: u64) -> Option<Arc<V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let shard_idx = self.shard_for_hash(key_hash);
+        self.shards[shard_idx].remove(key)
+    }
+
+    /// Returns whether the map contains a value for the given key.
+    pub fn contains_key(&self, key: &K) -> bool {
+        let shard_idx = self.shard_index(key);
+        self.shards[shard_idx].contains_key(key)
+    }
+
+    /// Remove all entries from the map.
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            shard.clear();
+        }
+    }
+
+    /// Retain only entries for which the predicate returns true.
+    /// Requires `V: Clone` because values may be cloned when modified in place.
+    pub fn retain<F>(&self, mut f: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+        V: Clone,
+    {
+        for shard in &self.shards {
+            shard.retain(&mut f);
+        }
+    }
+
+    /// Total capacity across all shards (number of elements that can be stored without reallocating).
+    pub fn capacity(&self) -> usize {
+        self.shards.iter().map(|s| s.capacity()).sum()
+    }
+
+    /// Shrink each shard to fit its current length. Reduces memory use after removals.
+    pub fn shrink_to_fit(&self) {
+        for shard in &self.shards {
+            shard.shrink_to_fit();
+        }
+    }
+
+    /// Get the value for the key, or insert the value and return a new `Arc<V>`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use shardmap::ShardMap;
+    ///
+    /// let map = ShardMap::new();
+    /// let v = map.get_or_insert("counter", 0);
+    /// assert_eq!(*v, 0);
+    /// map.get_or_insert("counter", 99); // no-op, already present
+    /// assert_eq!(*map.get(&"counter").unwrap(), 0);
+    /// ```
+    pub fn get_or_insert(&self, key: K, value: V) -> Arc<V> {
+        let shard_idx = self.shard_index(&key);
+        self.shards[shard_idx].get_or_insert(key, value)
+    }
+
+    /// Get the value for the key, or compute it with `f` and insert it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use shardmap::ShardMap;
+    ///
+    /// let map = ShardMap::new();
+    /// let v = map.get_or_insert_with("expensive", || "computed".to_string());
+    /// assert_eq!(v.as_str(), "computed");
+    /// ```
+    pub fn get_or_insert_with<F>(&self, key: K, f: F) -> Arc<V>
+    where
+        F: FnOnce() -> V,
+    {
+        let shard_idx = self.shard_index(&key);
+        self.shards[shard_idx].get_or_insert_with(key, f)
+    }
+
+    /// Insert the key-value pair only if the key is not present.
+    /// Returns `Ok(arc)` with the inserted value, or `Err(arc)` with the existing value.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use shardmap::ShardMap;
+    ///
+    /// let map = ShardMap::new();
+    /// assert!(map.try_insert("key", "first").is_ok());
+    /// assert!(map.try_insert("key", "second").is_err());
+    /// assert_eq!(*map.get(&"key").unwrap(), "first");
+    /// ```
+    pub fn try_insert(&self, key: K, value: V) -> Result<Arc<V>, Arc<V>> {
+        let shard_idx = self.shard_index(&key);
+        self.shards[shard_idx].try_insert(key, value)
+    }
+
     /// Update a value using a closure, returning the new value if the key existed.
     ///
     /// Note: This requires `V: Clone` because if the value is shared (multiple
@@ -144,14 +330,18 @@ where
         self.shards[shard_idx].update(key, f)
     }
 
-    /// Atomically rename a key to a new key, moving the value without copying.
+    /// Rename a key to a new key, moving the value without copying.
     ///
-    /// This operation is atomic: either both the old key is removed and the new
-    /// key is inserted, or neither happens. If the new key already exists, an
-    /// error is returned.
+    /// **Same shard:** The operation is atomic under that shard's lock: either
+    /// both the old key is removed and the new key is inserted, or neither happens.
     ///
-    /// Note: For cross-shard renames (when old and new keys map to different
-    /// shards), this requires `K: Clone` to handle conflict recovery.
+    /// **Cross-shard:** Old and new keys map to different shards. This implementation
+    /// acquires both shard locks (old then new). The move is atomic from the caller's
+    /// view (all-or-nothing), but it is not a single lock — so don't assume the same
+    /// atomicity guarantees as within a single shard.
+    ///
+    /// Returns an error if the old key is missing or the new key already exists.
+    /// For cross-shard renames, `K: Clone` is required for conflict recovery.
     ///
     /// # Example
     ///
@@ -234,9 +424,45 @@ where
         self.shards.iter().all(|shard| shard.is_empty())
     }
 
+    /// Per-shard entry counts. Works without the `metrics` feature. Use for imbalance detection.
+    pub fn shard_loads(&self) -> Vec<usize> {
+        self.shards.iter().map(|s| s.len()).collect()
+    }
+
+    /// Structured diagnostics snapshot: per-shard stats, total operations, and raw `max_load_ratio` for you to interpret.
+    pub fn diagnostics(&self) -> Diagnostics {
+        let shards: Vec<ShardDiagnostics> = self
+            .shards
+            .iter()
+            .map(|s| s.diagnostics_snapshot())
+            .collect();
+        let total_entries: usize = shards.iter().map(|s| s.entries).sum();
+        let n = self.shards.len() as f64;
+        let avg_load_per_shard = if n > 0.0 {
+            total_entries as f64 / n
+        } else {
+            0.0
+        };
+        let max_load = shards.iter().map(|s| s.entries).max().unwrap_or(0) as f64;
+        let max_load_ratio = if avg_load_per_shard > 0.0 {
+            max_load / avg_load_per_shard
+        } else {
+            1.0
+        };
+        let total_operations: u64 = shards.iter().map(|s| s.reads + s.writes + s.removes).sum();
+
+        Diagnostics {
+            total_entries,
+            shards,
+            total_operations,
+            avg_load_per_shard,
+            max_load_ratio,
+        }
+    }
+
     /// Get detailed statistics about the map and its shards.
     pub fn stats(&self) -> Stats {
-        let shard_sizes: Vec<usize> = self.shards.iter().map(|s| s.len()).collect();
+        let shard_sizes = self.shard_loads();
         let operations: Vec<ShardOps> = self.shards.iter().map(|s| s.stats()).collect();
         let size: usize = shard_sizes.iter().sum();
 
