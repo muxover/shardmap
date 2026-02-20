@@ -8,7 +8,7 @@
 
 **Performance-predictable, introspectable concurrent map for Rust.**
 
-[Features](#-features) • [Quick Start](#-quick-start) • [Documentation](https://docs.rs/shardmap) • [Configuration](#️-configuration) • [API Overview](#-api-overview) • [Benchmarks](#-benchmarks) • [Non-goals](#-non-goals) • [License](#-license)
+[Features](#-features) • [Quick Start](#-quick-start) • [Documentation](https://docs.rs/shardmap) • [Configuration](#️-configuration) • [API Overview](#-api-overview) • [Benchmarks](#-benchmarks) • [Non-goals](#-non-goals) • [Contributing](#-contributing) • [License](#-license)
 
 </div>
 
@@ -54,16 +54,17 @@ shardmap = { version = "0.2", default-features = false }
 use shardmap::ShardMap;
 
 let map = ShardMap::new();
-map.insert("key1", "value1");
-map.insert("key2", "value2");
+map.insert("user:1", "Alice");
+map.insert("user:2", "Bob");
 
-if let Some(v) = map.get(&"key1") {
-    println!("{}", *v);
+// Read: get returns Arc<V>, so you can use the value without holding the lock
+if let Some(name) = map.get(&"user:1") {
+    println!("{}", *name);
 }
 
-// Per-shard entry counts (no feature required)
+// Introspection: per-shard entry counts, no feature required
 let loads = map.shard_loads();
-println!("Shard loads: {:?}", loads);
+println!("Entries per shard: {:?}", loads);
 ```
 
 ## ✨ When to use ShardMap
@@ -101,8 +102,8 @@ println!("Shard loads: {:?}", loads);
 
 ### Iteration
 
-- `iter_snapshot()` — Snapshot of current state.
-- `iter_concurrent()` — Live view (holds shard locks while iterating).
+- **`iter_snapshot()`** — Copies current entries then iterates; consistent view, no lock held during iteration.
+- **`iter_concurrent()`** — Iterates while holding shard locks; can see concurrent writes but may see partial state.
 
 ## ⚙️ Configuration
 
@@ -126,7 +127,7 @@ Shard count must be a power of two (2, 4, 8, 16, 32, 64, …). Start with 16 and
 
 ## 📊 Diagnostics and imbalance
 
-`diagnostics()` returns a snapshot with **`max_load_ratio`** (max shard load / average load). There is no hardcoded “imbalance” threshold — you decide (e.g. alert when `max_load_ratio > 2.0`).
+Use **`diagnostics()`** to detect hot shards or imbalance. It returns **`max_load_ratio`** (max shard load ÷ average). There is no built-in threshold — you decide (e.g. alert when `max_load_ratio > 2.0`).
 
 ```rust
 let diag = map.diagnostics();
@@ -177,9 +178,9 @@ All ShardMap benchmarks use the **default** build (no `metrics` feature).
 
 ## 🏗️ Design
 
-- **Locks** — `parking_lot::RwLock` per shard for speed and fairness.
-- **Storage** — `hashbrown::HashMap` and `Arc<V>` for values. Values are stored in `Arc<V>` so readers can clone the pointer and use the value without holding the shard lock.
-- **Shard count** — Power of two so routing uses a mask instead of modulo.
+- **Locks** — `parking_lot::RwLock` per shard; no global lock.
+- **Storage** — `hashbrown::HashMap` per shard. Values are **`Arc<V>`**: readers clone the `Arc` and use the value without holding the lock (no copy of `V`).
+- **Shard count** — Power of two so routing is a bitmask (`hash & (n - 1)`), no division.
 
 ## 🚫 Non-goals
 
@@ -189,6 +190,10 @@ ShardMap is focused. The following are explicitly **not** goals:
 - **Read-heavy specialization** — Not tuned specifically for read-heavy workloads (consider evmap or similar if that’s your main use case).
 - **Dynamic sharding** — No background rebalancing or dynamic shard resizing; shard count is fixed at build time.
 - **Eviction or persistence** — No built-in eviction, LRU, or persistence; use with other crates if needed.
+
+## 🤝 Contributing
+
+Contributions are welcome. Please open an [issue](https://github.com/muxover/shardmap/issues) or [pull request](https://github.com/muxover/shardmap) on GitHub.
 
 ## 📄 License
 
